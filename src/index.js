@@ -1,11 +1,14 @@
+const VERSION = '2026-09-08.2';
+
 const json = (data, status = 200) =>
-  new Response(JSON.stringify(data), {
+  new Response(JSON.stringify(data, null, 2), {
     status,
     headers: {
       'content-type': 'application/json; charset=utf-8',
       'access-control-allow-origin': '*',
       'access-control-allow-headers': 'content-type, authorization',
       'access-control-allow-methods': 'GET, POST, OPTIONS',
+      'cache-control': 'no-store',
     },
   });
 
@@ -26,6 +29,21 @@ function requireFields(body, fields) {
     if (!body?.[field]) return field;
   }
   return null;
+}
+
+function apiInfo() {
+  return json({
+    ok: true,
+    service: 'rescuelink-api',
+    version: VERSION,
+    message: 'RescueLink API is running',
+    endpoints: {
+      health: 'GET /health',
+      beacons: 'GET /api/beacons',
+      reports: 'POST /api/reports',
+      events: 'POST /api/events',
+    },
+  });
 }
 
 async function saveReport(env, body) {
@@ -68,7 +86,6 @@ async function saveEvent(env, body) {
   const missing = requireFields(body, ['id', 'type', 'createdAt']);
   if (missing) return json({ error: `Missing field: ${missing}` }, 400);
 
-  // Never mark a report RESCUED from BLE alone. BLE is only a proximity signal.
   await env.DB.prepare(`
     INSERT INTO rescue_events (
       id, report_id, event_type, beacon_token, beacon_label, rssi,
@@ -112,15 +129,30 @@ export default {
     if (request.method === 'OPTIONS') return text('', 204);
 
     const url = new URL(request.url);
-    if (request.method === 'GET' && url.pathname === '/health') {
-      return json({ ok: true, service: 'rescuelink-api' });
+    const pathname = url.pathname.length > 1
+      ? url.pathname.replace(/\/+$/, '')
+      : url.pathname;
+
+    if (request.method === 'GET' && (pathname === '/' || pathname === '/api')) {
+      return apiInfo();
     }
 
-    if (request.method === 'GET' && url.pathname === '/api/beacons') {
-      return getBeacons(env);
+    if (request.method === 'GET' && pathname === '/health') {
+      return json({ ok: true, service: 'rescuelink-api', version: VERSION });
     }
 
-    if (request.method === 'POST' && url.pathname === '/api/reports') {
+    if (request.method === 'GET' && pathname === '/api/beacons') {
+      try {
+        return await getBeacons(env);
+      } catch (error) {
+        return json({
+          error: 'Database request failed',
+          detail: error instanceof Error ? error.message : 'Unknown database error',
+        }, 500);
+      }
+    }
+
+    if (request.method === 'POST' && pathname === '/api/reports') {
       try {
         return await saveReport(env, await request.json());
       } catch (error) {
@@ -128,7 +160,7 @@ export default {
       }
     }
 
-    if (request.method === 'POST' && url.pathname === '/api/events') {
+    if (request.method === 'POST' && pathname === '/api/events') {
       try {
         return await saveEvent(env, await request.json());
       } catch (error) {
@@ -136,6 +168,17 @@ export default {
       }
     }
 
-    return json({ error: 'Not found' }, 404);
+    return json({
+      error: 'Not found',
+      path: pathname,
+      version: VERSION,
+      availableEndpoints: [
+        'GET /',
+        'GET /health',
+        'GET /api/beacons',
+        'POST /api/reports',
+        'POST /api/events',
+      ],
+    }, 404);
   },
 };
