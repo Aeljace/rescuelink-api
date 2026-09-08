@@ -1,4 +1,5 @@
-const VERSION = '2026-09-08.2';
+const VERSION = '2026-09-08.3';
+let schemaReadyPromise = null;
 
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data, null, 2), {
@@ -31,6 +32,68 @@ function requireFields(body, fields) {
   return null;
 }
 
+async function ensureSchema(env) {
+  if (!env.DB) throw new Error('D1 binding DB is not configured');
+
+  if (!schemaReadyPromise) {
+    schemaReadyPromise = env.DB.batch([
+      env.DB.prepare(`
+        CREATE TABLE IF NOT EXISTS reports (
+          id TEXT PRIMARY KEY,
+          reporter_name TEXT NOT NULL DEFAULT '',
+          contact TEXT NOT NULL DEFAULT '',
+          emergency_type TEXT NOT NULL,
+          description TEXT NOT NULL,
+          people_count INTEGER NOT NULL DEFAULT 1,
+          latitude REAL,
+          longitude REAL,
+          accuracy REAL,
+          status TEXT NOT NULL DEFAULT 'OPEN',
+          created_at TEXT NOT NULL,
+          received_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+      `),
+      env.DB.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_reports_status_created
+        ON reports(status, created_at DESC)
+      `),
+      env.DB.prepare(`
+        CREATE TABLE IF NOT EXISTS rescue_beacons (
+          id TEXT PRIMARY KEY,
+          label TEXT NOT NULL,
+          manufacturer_token TEXT NOT NULL UNIQUE,
+          active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+      `),
+      env.DB.prepare(`
+        CREATE TABLE IF NOT EXISTS rescue_events (
+          id TEXT PRIMARY KEY,
+          report_id TEXT,
+          event_type TEXT NOT NULL,
+          beacon_token TEXT,
+          beacon_label TEXT,
+          rssi INTEGER,
+          latitude REAL,
+          longitude REAL,
+          created_at TEXT NOT NULL,
+          received_at TEXT NOT NULL DEFAULT (datetime('now')),
+          FOREIGN KEY (report_id) REFERENCES reports(id)
+        )
+      `),
+      env.DB.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_rescue_events_report_created
+        ON rescue_events(report_id, created_at DESC)
+      `),
+    ]).catch(error => {
+      schemaReadyPromise = null;
+      throw error;
+    });
+  }
+
+  await schemaReadyPromise;
+}
+
 function apiInfo() {
   return json({
     ok: true,
@@ -39,6 +102,7 @@ function apiInfo() {
     message: 'RescueLink API is running',
     endpoints: {
       health: 'GET /health',
+      diagnostics: 'GET /api/diagnostics',
       beacons: 'GET /api/beacons',
       reports: 'POST /api/reports',
       events: 'POST /api/events',
@@ -46,9 +110,33 @@ function apiInfo() {
   });
 }
 
+async function diagnostics(env) {
+  await ensureSchema(env);
+
+  const [reports, beacons, events] = await Promise.all([
+    env.DB.prepare('SELECT COUNT(*) AS count FROM reports').first(),
+    env.DB.prepare('SELECT COUNT(*) AS count FROM rescue_beacons').first(),
+    env.DB.prepare('SELECT COUNT(*) AS count FROM rescue_events').first(),
+  ]);
+
+  return json({
+    ok: true,
+    service: 'rescuelink-api',
+    version: VERSION,
+    database: {
+      ready: true,
+      reports: Number(reports?.count ?? 0),
+      rescueBeacons: Number(beacons?.count ?? 0),
+      rescueEvents: Number(events?.count ?? 0),
+    },
+  });
+}
+
 async function saveReport(env, body) {
   const missing = requireFields(body, ['id', 'emergencyType', 'description', 'createdAt']);
   if (missing) return json({ error: `Missing field: ${missing}` }, 400);
+
+  await ensureSchema(env);
 
   const peopleCount = Math.max(1, Math.min(10000, Number.parseInt(body.peopleCount, 10) || 1));
 
@@ -86,6 +174,9 @@ async function saveEvent(env, body) {
   const missing = requireFields(body, ['id', 'type', 'createdAt']);
   if (missing) return json({ error: `Missing field: ${missing}` }, 400);
 
+  await ensureSchema(env);
+
+  // BLE is a proximity signal only; it never marks a person as rescued by itself.
   await env.DB.prepare(`
     INSERT INTO rescue_events (
       id, report_id, event_type, beacon_token, beacon_label, rssi,
@@ -108,6 +199,8 @@ async function saveEvent(env, body) {
 }
 
 async function getBeacons(env) {
+  await ensureSchema(env);
+
   const result = await env.DB.prepare(`
     SELECT id, label, manufacturer_token
     FROM rescue_beacons
@@ -139,6 +232,18 @@ export default {
 
     if (request.method === 'GET' && pathname === '/health') {
       return json({ ok: true, service: 'rescuelink-api', version: VERSION });
+    }
+
+    if (request.method === 'GET' && pathname === '/api/diagnostics') {
+      try {
+        return await diagnostics(env);
+      } catch (error) {
+        return json({
+          ok: false,
+          error: 'Database diagnostics failed',
+          detail: error instanceof Error ? error.message : 'Unknown database error',
+        }, 500);
+      }
     }
 
     if (request.method === 'GET' && pathname === '/api/beacons') {
@@ -175,6 +280,7 @@ export default {
       availableEndpoints: [
         'GET /',
         'GET /health',
+        'GET /api/diagnostics',
         'GET /api/beacons',
         'POST /api/reports',
         'POST /api/events',
